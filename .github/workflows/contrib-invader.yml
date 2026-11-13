@@ -1,0 +1,63 @@
+name: Contribution invader
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "gen_invader.py"
+      - ".github/workflows/contrib-invader.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate invader SVG
+        run: |
+          mkdir -p /tmp/invader-out
+          python3 gen_invader.py --user "${GITHUB_REPOSITORY_OWNER}" --out /tmp/invader-out/contrib-invader.svg
+
+      - name: Publish to output branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH=output
+          WORK="/tmp/invader-branch"
+          rm -rf "${WORK}"
+
+          if git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${BRANCH}"
+            git worktree add "${WORK}" "origin/${BRANCH}"
+          else
+            git worktree add --detach "${WORK}"
+            git -C "${WORK}" checkout --orphan "${BRANCH}"
+            git -C "${WORK}" rm -rf --ignore-unmatch .
+          fi
+
+          cp /tmp/invader-out/contrib-invader.svg "${WORK}/contrib-invader.svg"
+          git -C "${WORK}" add contrib-invader.svg
+
+          if git -C "${WORK}" diff --staged --quiet; then
+            echo "No changes to publish."
+            exit 0
+          fi
+
+          git -C "${WORK}" commit -m "chore: refresh contribution invader"
+          git -C "${WORK}" push origin "HEAD:${BRANCH}"
