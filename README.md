@@ -27,7 +27,7 @@
 ## Projects
 
 <ul>
-<li><strong><a href="https://bugnarok.dev">BUGNAROK</a></strong>: Personal landing and terminal.</li>
+<li><strong><a href="">BUGNAROK</a></strong>: Personal landing and terminal.</li>
 <li>
 <p><strong>WaspSoC</strong>: The System-on-Chip for sovereign AI agents.</p>
 <p>WaspSoC is a sovereign, ultra-fast WebAssembly runtime for AI agents, written in 100% Rust. It replaces Docker, KVM and heavyweight container runtimes with WASI (WebAssembly System Interface, Preview 2): a fast, secure and economical substrate for running sovereign AI agents.</p>
