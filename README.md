@@ -39,7 +39,7 @@
 
 ## Links
 
-- X: [@bugnarokdev](https://x.com/bugnarokdev)
+- X: [@bugnarokdev](https://x.com/BugNaR0k)
 - Site: [bugnarok.dev](https://bugnarok.dev)
 
 ## Contributions
