@@ -2,7 +2,9 @@ name: Contribution invader
 
 on:
   schedule:
-    - cron: "17 4 * * *"
+    # GitHub delays scheduled runs by hours, so refresh several times a day to
+    # keep the grid within a few contributions of the live profile.
+    - cron: "17 */6 * * *"
   workflow_dispatch:
   push:
     branches: [main]
