@@ -13,16 +13,42 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html
 import json
+import os
+import re
 import sys
+import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
 
-API_URL = "https://github-contributions-api.jogruber.de/v4/{user}"
+# Official, token-free source: the public contribution calendar rendered by GitHub
+# itself. The previous third-party mirror (github-contributions-api.jogruber.de)
+# silently served halved per-day counts and dropped the most recent days, which
+# made the published SVG disagree with the profile.
+GITHUB_CONTRIB_URL = "https://github.com/users/{user}/contributions?from={year}-01-01&to={year}-12-31"
+GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
+GRAPHQL_QUERY = """
+query($login: String!, $from: DateTime!, $to: DateTime!) {
+  user(login: $login) {
+    contributionsCollection(from: $from, to: $to) {
+      contributionCalendar {
+        weeks {
+          contributionDays { date contributionCount }
+        }
+      }
+    }
+  }
+}
+"""
+HTTP_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
 
 # Brand
 BG = "#0a0a0a"
@@ -178,25 +204,163 @@ def build_grid(
     return grid, first, last
 
 
-def fetch_contributions(user: str, years: list[int]) -> tuple[list[dict], dict, str]:
-    all_rows: list[dict] = []
-    totals: dict[str, int] = {}
-    for year in years:
-        url = API_URL.format(user=user) + f"?y={year}"
-        req = urllib.request.Request(url, headers={"User-Agent": "bugnarok-contrib-invader/1.0"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        all_rows.extend(data.get("contributions") or [])
-        totals.update(data.get("total") or {})
-    # de-dupe
-    seen: set[str] = set()
-    unique: list[dict] = []
-    for row in sorted(all_rows, key=lambda r: r["date"]):
-        if row["date"] in seen:
+def _count_from_tooltip(text: str) -> int:
+    """Extract the contribution count from a GitHub calendar tooltip."""
+    if not text or text.startswith("No contributions"):
+        return 0
+    m = re.search(r"(\d+)\s+contributions?", text)
+    return int(m.group(1)) if m else 0
+
+
+def _parse_calendar(html_text: str) -> list[dict]:
+    """Parse GitHub's rendered contribution calendar into dated rows.
+
+    GitHub embeds one <td data-date=... data-level=...> per day plus a matching
+    <tool-tip> carrying the exact count. Levels are recalculated locally so the
+    palette stays stable across pages instead of trusting the per-page scale.
+    """
+    tooltips = {
+        tid: " ".join(html.unescape(re.sub(r"<[^>]+>", "", body)).split())
+        for tid, body in re.findall(
+            r'<tool-tip[^>]*for="([^"]+)"[^>]*>(.*?)</tool-tip>', html_text, re.S
+        )
+    }
+    rows: list[dict] = []
+    for match in re.finditer(r"<td\b[^>]*>", html_text):
+        tag = match.group(0)
+        dated = re.search(r'data-date="(\d{4}-\d{2}-\d{2})"', tag)
+        if not dated:
             continue
-        seen.add(row["date"])
-        unique.append(row)
-    return unique, totals, "github-contributions-api.jogruber.de"
+        tip_id = re.search(r'id="([^"]+)"', tag)
+        count = _count_from_tooltip(tooltips.get(tip_id.group(1), "") if tip_id else "")
+        rows.append({"date": dated.group(1), "count": count, "level": 0})
+    rows.sort(key=lambda r: r["date"])
+    return rows
+
+
+def _assign_levels(rows: list[dict]) -> None:
+    """Map counts to the 0..4 palette using GitHub-like quartiles of active days."""
+    counts = sorted(r["count"] for r in rows if r["count"] > 0)
+    if not counts:
+        return
+
+    def quantile(p: float) -> int:
+        idx = min(len(counts) - 1, max(0, int(round(p * (len(counts) - 1)))))
+        return counts[idx]
+
+    q25, q50, q75 = quantile(0.25), quantile(0.50), quantile(0.75)
+    for row in rows:
+        c = row["count"]
+        if c <= 0:
+            row["level"] = 0
+        elif c <= q25:
+            row["level"] = 1
+        elif c <= q50:
+            row["level"] = 2
+        elif c <= q75:
+            row["level"] = 3
+        else:
+            row["level"] = 4
+
+
+def _fetch_graphql_year(user: str, year: int, token: str) -> list[dict]:
+    """Fetch one year of contributions from GitHub's official GraphQL API.
+
+    Preferred in CI: authenticated, stable markup, and it includes private
+    contributions the caller is allowed to see. Window is capped at one year
+    because contributionsCollection rejects longer ranges.
+    """
+    payload = json.dumps(
+        {
+            "query": GRAPHQL_QUERY,
+            "variables": {
+                "login": user,
+                "from": f"{year}-01-01T00:00:00Z",
+                "to": f"{year}-12-31T23:59:59Z",
+            },
+        }
+    ).encode()
+    req = urllib.request.Request(
+        GITHUB_GRAPHQL_URL,
+        data=payload,
+        headers={
+            "Authorization": f"bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "bugnarok-contrib-invader/2.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    if body.get("errors"):
+        raise RuntimeError(f"GraphQL errors: {body['errors']}")
+    node = (body.get("data") or {}).get("user")
+    if not node:
+        raise RuntimeError(f"GraphQL returned no user for {user}")
+    weeks = node["contributionsCollection"]["contributionCalendar"]["weeks"]
+    rows = [
+        {"date": day["date"], "count": int(day["contributionCount"]), "level": 0}
+        for week in weeks
+        for day in week["contributionDays"]
+    ]
+    if not rows:
+        raise ValueError(f"GraphQL returned an empty calendar for {year}")
+    return rows
+
+
+def fetch_contributions(user: str, years: list[int]) -> tuple[list[dict], dict, str]:
+    """Fetch the official GitHub contribution calendar for the given years.
+
+    Uses the authenticated GraphQL API when a token is present (CI), otherwise
+    the public calendar page. Retries transient failures, merges every year into
+    one date-sorted series, and raises if nothing usable comes back so the caller
+    can fall back to the labeled sample instead of publishing wrong numbers.
+    """
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+    merged: dict[str, dict] = {}
+    source = ""
+    for year in years:
+        last_error: Exception | None = None
+        rows: list[dict] = []
+        for attempt in range(3):
+            try:
+                if token:
+                    rows = _fetch_graphql_year(user, year, token)
+                    source = "GitHub GraphQL API"
+                else:
+                    url = GITHUB_CONTRIB_URL.format(user=user, year=year)
+                    req = urllib.request.Request(
+                        url,
+                        headers={
+                            "User-Agent": HTTP_UA,
+                            "Accept": "text/html,application/xhtml+xml",
+                            "Cache-Control": "no-cache",
+                        },
+                    )
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        body = resp.read().decode("utf-8", "replace")
+                    rows = _parse_calendar(body)
+                    source = "github.com/users/{user}/contributions".format(user=user)
+                if not rows:
+                    raise ValueError(f"no contribution rows for {year}")
+                break
+            except Exception as exc:  # network, auth, or markup drift
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(2 + attempt * 3)
+        else:
+            raise RuntimeError(f"GitHub contributions fetch failed for {year}: {last_error}")
+        for row in rows:
+            merged[row["date"]] = row
+
+    unique = [merged[k] for k in sorted(merged)]
+    _assign_levels(unique)
+    totals = {str(y): 0 for y in years}
+    for row in unique:
+        year_key = row["date"][:4]
+        if year_key in totals:
+            totals[year_key] += row["count"]
+    return unique, totals, source or "GitHub"
+
 
 
 def load_json(path: Path) -> tuple[list[dict], dict, str]:
@@ -497,7 +661,7 @@ def build_svg(
 
     year_span = first.year if first.year == end.year else f"{first.year}-{end.year}"
     title_main = "CONTRIBUTION_MAP"
-    total_lbl = f"{total:,} COMMITS"
+    total_lbl = f"{total:,} CONTRIBUTIONS"
     if is_sample:
         title_main = "CONTRIBUTION_MAP  ·  SAMPLE DATA"
         source_label = "sample data (not live GitHub contributions)"
@@ -816,14 +980,21 @@ def rows_to_map(rows: list[dict]) -> dict[str, dict[str, int]]:
     return out
 
 
-def infer_total(rows: list[dict], totals: dict, end: date) -> int:
-    if totals:
-        # sum years that overlap the visible window; prefer exact year sums
-        try:
-            return int(sum(int(v) for v in totals.values()))
-        except Exception:
-            pass
-    return sum(int(r.get("count") or 0) for r in rows if r["date"] <= end.isoformat() and r["date"][:4] == str(end.year))
+def infer_total(rows: list[dict], totals: dict, end: date, first: date | None = None) -> int:
+    """Total of contributions inside the visible grid window.
+
+    The header figure must always equal the sum of the cells actually drawn;
+    falling back to a year-wide total is what let the published SVG disagree
+    with the grid (and with the GitHub profile) in the first place.
+    """
+    lower = first.isoformat() if first else f"{end.year - 1}-01-01"
+    upper = end.isoformat()
+    window = sum(
+        int(r.get("count") or 0) for r in rows if lower <= r.get("date", "") <= upper
+    )
+    if window:
+        return window
+    return sum(int(v) for v in totals.values()) if totals else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -838,7 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.end_date:
         end = date.fromisoformat(args.end_date)
     else:
-        end = datetime.utcnow().date()
+        end = datetime.now(timezone.utc).date()
 
     is_sample = False
     source = ""
@@ -861,20 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cmap = rows_to_map(rows)
     grid, first, _last = build_grid(cmap, end)
-    total = infer_total(rows, totals, end)
-    # If totals include an empty previous year, prefer the current year figure
-    if totals and str(end.year) in {str(k) for k in totals}:
-        try:
-            total = int(totals[str(end.year)] if str(end.year) in totals else totals[end.year])
-        except Exception:
-            try:
-                total = int(totals[str(end.year)])
-            except Exception:
-                pass
-        # keys might be str
-        for k, v in totals.items():
-            if str(k) == str(end.year):
-                total = int(v)
+    total = infer_total(rows, totals, end, first)
 
     svg = build_svg(grid, first, end, total, source, is_sample, args.user)
     args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -28,9 +28,65 @@ jobs:
           python-version: "3.12"
 
       - name: Generate invader SVG
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p /tmp/invader-out
-          python3 gen_invader.py --user "${GITHUB_REPOSITORY_OWNER}" --out /tmp/invader-out/contrib-invader.svg
+          python3 gen_invader.py --user "${GITHUB_REPOSITORY_OWNER}" --out /tmp/invader-out/contrib-invader.svg | tee /tmp/invader-out/report.txt
+
+      - name: Verify the SVG reflects real contributions
+        run: |
+          set -euo pipefail
+          SVG=/tmp/invader-out/contrib-invader.svg
+          REPORT=/tmp/invader-out/report.txt
+
+          if grep -q "sample=True" "$REPORT"; then
+            echo "::error::Generator fell back to sample data; refusing to publish wrong numbers."
+            cat "$REPORT"
+            exit 1
+          fi
+
+          python3 - "$SVG" <<'PY'
+          import datetime as dt
+          import re, sys, xml.etree.ElementTree as ET
+
+          ET.parse(sys.argv[1])  # must be well-formed XML
+          text = open(sys.argv[1], encoding="utf-8").read()
+
+          header = re.search(r"([\d,]+) CONTRIBUTIONS", text)
+          if not header:
+              sys.exit("::error::No contribution total found in the SVG header")
+          total = int(header.group(1).replace(",", ""))
+
+          counts = [int(c) for c in re.findall(r"<title>(\d+) contributions? on \d{4}-\d{2}-\d{2}</title>", text)]
+          if total <= 0 or not counts:
+              sys.exit("::error::Empty contribution grid, refusing to publish")
+          if total != sum(counts):
+              sys.exit(f"::error::Header total {total} != sum of drawn cells {sum(counts)}")
+
+          targets = re.search(r"(\d+) TARGETS", text)
+          if targets and int(targets.group(1)) != len(counts):
+              sys.exit(f"::error::TARGETS {targets.group(1)} != {len(counts)} titled cells")
+
+          # Only GitHub's own calendar is authoritative. A third-party mirror once
+          # served halved per-day counts and dropped recent days, which published
+          # an SVG that disagreed with the profile (1909 vs 2017).
+          desc = re.search(r"<desc>(.*?)</desc>", text, re.S)
+          desc = desc.group(1) if desc else ""
+          if not ("github.com/users/" in desc or "GitHub GraphQL API" in desc):
+              sys.exit(f"::error::Unexpected data source: {desc[:120]}")
+
+          # Data must be current: a lagging source silently loses the newest days.
+          window = re.search(r"from (\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})", desc)
+          if not window:
+              sys.exit("::error::No date window announced in the SVG")
+          end = dt.date.fromisoformat(window.group(2))
+          lag = (dt.datetime.now(dt.timezone.utc).date() - end).days
+          if lag < 0 or lag > 2:
+              sys.exit(f"::error::Contribution data is stale: grid ends {end} ({lag} days lag)")
+
+          print(f"verified: {total} contributions across {len(counts)} active days, source=github, end={end}")
+          PY
 
       - name: Publish to output branch
         run: |
