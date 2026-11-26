@@ -33,7 +33,7 @@
 <p>WaspSoC is a sovereign, ultra-fast WebAssembly runtime for AI agents, written in 100% Rust. It replaces Docker, KVM and heavyweight container runtimes with WASI (WebAssembly System Interface, Preview 2): a fast, secure and economical substrate for running sovereign AI agents.</p>
 </li>
 <li><strong>Hubbl</strong>: Signal intelligence: editorial engine and public surface.</li>
-<li><strong><a href="https://mnemos.rest">Mnemos</a></strong>: Sovereign memory for Hermes Agent.</li>
+<li><strong>Mnemos</strong>: Sovereign memory for Hermes Agent.</li>
 <li><strong>ENS CCIP-Read resolver</strong>: Self-hosted CCIP-Read resolver for ENS, written in Rust.</li>
 </ul>
 
